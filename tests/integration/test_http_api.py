@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import httpx
 from httpx import ASGITransport
 
@@ -7,9 +9,11 @@ from app.domain.models import (
     ChatResponse,
     ChatStreamEvent,
     ChatStreamEventType,
+    SessionSummary,
     StopReason,
     Usage,
 )
+from app.use_cases.manage_sessions import SessionManagementUseCase
 from app.use_cases.send_message import SendMessageUseCase
 
 
@@ -31,13 +35,16 @@ class _FakeBackend:
     def __init__(self, response: ChatResponse | None = None, error: Exception | None = None):
         self._response = response
         self._error = error
+        self.last_request = None
 
     async def complete(self, request):
+        self.last_request = request
         if self._error:
             raise self._error
         return self._response
 
     async def stream(self, request):
+        self.last_request = request
         if self._error:
             raise self._error
         response = self._response
@@ -52,9 +59,24 @@ class _FakeBackend:
         )
 
 
-def _make_client(backend) -> httpx.AsyncClient:
+class _FakeSessionRepository:
+    """Fakes the SessionRepository port -- an in-memory dict, no filesystem."""
+
+    def __init__(self, sessions: dict[str, SessionSummary] | None = None):
+        self._sessions = sessions or {}
+
+    async def list_sessions(self) -> list[SessionSummary]:
+        return sorted(self._sessions.values(), key=lambda s: s.last_used_at, reverse=True)
+
+    async def delete_session(self, session_id: str) -> bool:
+        return self._sessions.pop(session_id, None) is not None
+
+
+def _make_client(backend, session_repository=None) -> httpx.AsyncClient:
+    session_repository = session_repository or _FakeSessionRepository()
     app = create_app(
         use_case=SendMessageUseCase(backend),
+        session_management_use_case=SessionManagementUseCase(session_repository),
         proxy_api_keys=["test-key"],
         default_model="claude-opus-4-8",
     )
@@ -130,3 +152,56 @@ async def test_backend_auth_error_maps_to_500_api_error():
         )
     assert resp.status_code == 500
     assert resp.json()["error"]["type"] == "api_error"
+
+
+async def test_x_session_id_header_threads_into_domain_request():
+    backend = _FakeBackend(_default_response())
+    async with _make_client(backend) as client:
+        resp = await client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "x-session-id": "demo-1"},
+            json=_VALID_BODY,
+        )
+    assert resp.status_code == 200
+    assert backend.last_request.session_id == "demo-1"
+
+
+async def test_no_session_header_leaves_session_id_none():
+    backend = _FakeBackend(_default_response())
+    async with _make_client(backend) as client:
+        await client.post("/v1/messages", headers={"x-api-key": "test-key"}, json=_VALID_BODY)
+    assert backend.last_request.session_id is None
+
+
+async def test_list_sessions_returns_summaries():
+    now = datetime.now(timezone.utc)
+    repo = _FakeSessionRepository(
+        {"demo-1": SessionSummary(id="demo-1", created_at=now, last_used_at=now)}
+    )
+    async with _make_client(_FakeBackend(), repo) as client:
+        resp = await client.get("/v1/sessions", headers={"x-api-key": "test-key"})
+    assert resp.status_code == 200
+    assert resp.json()["data"][0]["id"] == "demo-1"
+
+
+async def test_delete_unknown_session_returns_404():
+    async with _make_client(_FakeBackend()) as client:
+        resp = await client.delete("/v1/sessions/nope", headers={"x-api-key": "test-key"})
+    assert resp.status_code == 404
+    assert resp.json()["error"]["type"] == "not_found_error"
+
+
+async def test_delete_known_session_returns_204():
+    now = datetime.now(timezone.utc)
+    repo = _FakeSessionRepository(
+        {"demo-1": SessionSummary(id="demo-1", created_at=now, last_used_at=now)}
+    )
+    async with _make_client(_FakeBackend(), repo) as client:
+        resp = await client.delete("/v1/sessions/demo-1", headers={"x-api-key": "test-key"})
+    assert resp.status_code == 204
+
+
+async def test_sessions_endpoints_require_auth():
+    async with _make_client(_FakeBackend()) as client:
+        resp = await client.get("/v1/sessions")
+    assert resp.status_code == 401

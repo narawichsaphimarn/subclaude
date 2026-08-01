@@ -20,6 +20,7 @@ from app.adapters.outbound.claude_agent_sdk.response_mapper import (
     build_response,
     to_stream_events,
 )
+from app.adapters.outbound.claude_agent_sdk.session_repository import SessionUuidResolver
 from app.domain.errors import (
     BackendAuthError,
     BackendTimeoutError,
@@ -47,11 +48,16 @@ class ClaudeAgentSdkBackend:
         max_concurrent_requests: int,
         queue_timeout_s: float,
         request_timeout_s: float,
+        session_resolver: SessionUuidResolver | None = None,
+        session_cwd: str | None = None,
     ) -> None:
         self._disallowed_tools = disallowed_tools
         self._queue_timeout_s = queue_timeout_s
         self._request_timeout_s = request_timeout_s
         self._semaphore = asyncio.Semaphore(max_concurrent_requests)
+        self._session_resolver = session_resolver
+        self._session_cwd = session_cwd
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     async def complete(self, request: ChatRequest) -> ChatResponse:
         sdk_messages = await self._run(request)
@@ -73,7 +79,7 @@ class ClaudeAgentSdkBackend:
         await self._acquire_slot()
         try:
             return await asyncio.wait_for(
-                self._run_in_temp_cwd(request), timeout=self._request_timeout_s
+                self._dispatch(request), timeout=self._request_timeout_s
             )
         except asyncio.TimeoutError as exc:
             raise BackendTimeoutError(
@@ -90,7 +96,12 @@ class ClaudeAgentSdkBackend:
                 "too many concurrent requests to the local Claude proxy; try again shortly"
             ) from exc
 
-    async def _run_in_temp_cwd(self, request: ChatRequest) -> list[Any]:
+    async def _dispatch(self, request: ChatRequest) -> list[Any]:
+        if request.session_id is None:
+            return await self._run_stateless(request)
+        return await self._run_session(request)
+
+    async def _run_stateless(self, request: ChatRequest) -> list[Any]:
         cwd = tempfile.mkdtemp(prefix="subclaude-")
         try:
             options = build_options(request, cwd=cwd, disallowed_tools=self._disallowed_tools)
@@ -98,6 +109,30 @@ class ClaudeAgentSdkBackend:
             return await self._collect_messages(prompt, options)
         finally:
             shutil.rmtree(cwd, ignore_errors=True)
+
+    async def _run_session(self, request: ChatRequest) -> list[Any]:
+        if not (self._session_resolver and self._session_cwd):
+            raise BackendUnavailableError("session support is not configured on this server")
+        label = request.session_id
+        lock = self._session_locks.setdefault(label, asyncio.Lock())
+        async with lock:
+            session_uuid, is_new = await self._session_resolver.resolve_uuid(label)
+            message_window = request.messages if is_new else [request.messages[-1]]
+            options = build_options(
+                request,
+                cwd=self._session_cwd,
+                disallowed_tools=self._disallowed_tools,
+                messages=message_window,
+                session_id=session_uuid if is_new else None,
+                resume=None if is_new else session_uuid,
+            )
+            prompt = build_prompt(message_window)
+            result = await self._collect_messages(prompt, options)
+            # Only committed to the label->uuid map after query() succeeds,
+            # so a crash mid-first-call retries as a fresh session next time
+            # instead of resuming a uuid the CLI never wrote anything for.
+            await self._session_resolver.touch(label, uuid=session_uuid)
+            return result
 
     async def _collect_messages(self, prompt: str, options: Any) -> list[Any]:
         try:

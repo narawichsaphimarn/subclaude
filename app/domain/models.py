@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 
 
@@ -25,6 +26,16 @@ class ChatRequest:
     # True if the caller's wire request included `tools` and/or `tool_choice`.
     # This proxy is chat-only for v1; the use case rejects such requests.
     tools_requested: bool = False
+    # Caller-chosen label from the `x-session-id` header. None means today's
+    # fully stateless behavior (no change). See SessionRepository.
+    session_id: str | None = None
+
+
+@dataclass(frozen=True)
+class SessionSummary:
+    id: str  # caller-chosen label
+    created_at: datetime
+    last_used_at: datetime
 
 
 class StopReason(str, Enum):

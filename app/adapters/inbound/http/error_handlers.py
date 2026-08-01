@@ -14,6 +14,7 @@ from app.domain.errors import (
     DomainError,
     InvalidRequestError,
     RateLimitedError,
+    SessionNotFoundError,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ _STATUS_AND_TYPE: dict[type[DomainError], tuple[int, str]] = {
     BackendTimeoutError: (504, "api_error"),
     BackendAuthError: (500, "api_error"),
     BackendUnavailableError: (500, "api_error"),
+    SessionNotFoundError: (404, "not_found_error"),
 }
 
 

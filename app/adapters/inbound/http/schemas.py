@@ -5,7 +5,7 @@ from typing import Any, Literal, Union
 from pydantic import BaseModel, Field
 
 from app.domain.errors import InvalidRequestError
-from app.domain.models import ChatMessage, ChatRequest, ChatResponse, Role
+from app.domain.models import ChatMessage, ChatRequest, ChatResponse, Role, SessionSummary
 
 # --- Request DTOs (Anthropic /v1/messages wire shape) --------------------
 
@@ -29,7 +29,9 @@ class MessagesRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     tool_choice: dict[str, Any] | None = None
 
-    def to_domain(self, *, default_model: str | None = None) -> ChatRequest:
+    def to_domain(
+        self, *, default_model: str | None = None, session_id: str | None = None
+    ) -> ChatRequest:
         model = self.model or default_model
         if not model:
             raise InvalidRequestError("`model` is required")
@@ -40,6 +42,7 @@ class MessagesRequest(BaseModel):
             system=self.system,
             stream=self.stream,
             tools_requested=bool(self.tools or self.tool_choice),
+            session_id=session_id,
         )
 
 
@@ -95,4 +98,30 @@ class MessagesResponse(BaseModel):
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
             ),
+        )
+
+
+# --- Session management DTOs -----------------------------------------------
+
+
+class SessionSummaryOut(BaseModel):
+    id: str
+    created_at: str
+    last_used_at: str
+
+
+class SessionListResponse(BaseModel):
+    data: list[SessionSummaryOut]
+
+    @classmethod
+    def from_domain(cls, sessions: list[SessionSummary]) -> "SessionListResponse":
+        return cls(
+            data=[
+                SessionSummaryOut(
+                    id=s.id,
+                    created_at=s.created_at.isoformat(),
+                    last_used_at=s.last_used_at.isoformat(),
+                )
+                for s in sessions
+            ]
         )

@@ -49,6 +49,15 @@ class Settings(BaseSettings):
 
     disallowed_tools: list[str] = DEFAULT_DISALLOWED_TOOLS
 
+    # Caller-label -> claude_agent_sdk session UUID mapping (JSON file).
+    session_store_path: str = "~/.subclaude/sessions.json"
+    # Fixed working directory shared by every session-bound request. Must
+    # stay identical across restarts -- claude_agent_sdk keys stored
+    # sessions by a hash of this path, so changing it silently orphans every
+    # existing session (resume finds nothing, quietly starts fresh instead
+    # of erroring).
+    session_cwd: str = "~/.subclaude/session-cwd"
+
     @property
     def proxy_api_keys_list(self) -> list[str]:
         return [key.strip() for key in self.proxy_api_keys.split(",") if key.strip()]

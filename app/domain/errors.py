@@ -26,3 +26,7 @@ class BackendTimeoutError(DomainError):
 class RateLimitedError(DomainError):
     """Too many concurrent requests are already in flight against the
     backend."""
+
+
+class SessionNotFoundError(DomainError):
+    """No session exists for the given caller-chosen session id."""
